@@ -4,9 +4,10 @@
 \usepackage[russian]{babel}
 \usepackage{amsmath}
 \usepackage{graphicx}
+\usepackage{tabularx}
 
 \title{Автоматическое выделение доменных границ в белках по пространственной структуре}
-\author{ФИО, научный руководитель}
+\author{Терентьев Александр}
 \date{2025}
 
 \begin{document}
@@ -85,7 +86,7 @@
 \begin{frame}{GCN-модель (DomainGCN)}
   \begin{itemize}
     \item Вход: $\mathbf{X} \in \mathbb{R}^{n \times 3}$ — координаты CA, $G=(V,E)$ — граф контактов
-    \item Граф: $A_{ij} = 1$ если $\|\mathbf{x}_i - \mathbf{x}_j\| < 8\AA$
+    \item Граф: $A_{ij} = 1$ если $\|\mathbf{x}_i - \mathbf{x}_j\| < 8\text{\AA}$
     \item Модель: $\mathbf{H}^{(l+1)} = \sigma(\tilde{D}^{-1/2} \tilde{A} \tilde{D}^{-1/2} \mathbf{H}^{(l)} W^{(l)})$
     \item 4 слоя GCNConv, выход — вероятности классов для каждого остатка
     \item Функция потерь: $\mathcal{L} = -\sum_i w_{y_i} \log p_{i, y_i}$, $w_1 \gg w_0$
@@ -101,7 +102,10 @@
 % Слайд 8: Постановка эксперимента
 \begin{frame}{Постановка эксперимента}
   \begin{itemize}
-    \item Обучение на train, оценка на test
+    \item Использованы аннотированные белки из базы SCOP (Structural Classification of Proteins)
+    \item 3D-структуры белков загружались из PDB (Protein Data Bank)
+    \item Формирование ground truth: маска границ по SCOP-аннотациям
+    \item Обучение на train, оценка на test (разделение 80/20)
     \item Сравнение с DOMAK и SPLIT по всем метрикам
     \item Кросс-валидация для оценки дисперсии
   \end{itemize}
@@ -109,11 +113,26 @@
 
 % Слайд 9: Результаты (таблица)
 \begin{frame}{Результаты сравнения}
-  \begin{center}
-    \includegraphics[width=0.95\textwidth]{results_metrics.png} % вставьте скриншот/таблицу
-  \end{center}
+
+    \begin{table}[h!]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tabular}{|l|c|c|c|}
+    \hline
+    \textbf{Метрика} & \textbf{Model (mean$\pm$std)} & \textbf{DOMAK (mean$\pm$std)} & \textbf{SPLIT (mean$\pm$std)} \\
+    \hline
+    IoU (границы) & 0.1082 $\pm$ 0.1935 & 0.5162 $\pm$ 0.3786 & 0.5310 $\pm$ 0.4045 \\
+    IoU (домены) & 0.6122 $\pm$ 0.2596 & 0.8118 $\pm$ 0.2147 & 0.8674 $\pm$ 0.1896 \\
+    Boundary F1-score & 0.2544 $\pm$ 0.2732 & 0.6937 $\pm$ 0.3326 & 0.7206 $\pm$ 0.3436 \\
+    Mean Boundary Deviation & 6.46 $\pm$ 1.74 & 19.35 $\pm$ 36.36 & 8.28 $\pm$ 14.68 \\
+    \hline
+    \end{tabular}
+    }
+    \caption{Сравнение качества методов выделения доменных границ}
+    \end{table}
+
   \begin{itemize}
-    \item GCN превосходит классические методы по большинству метрик
+    \item GCN превосходит классические методы по близости полученных границ, но он выдает больше фантомных границ
   \end{itemize}
 \end{frame}
 
@@ -123,7 +142,13 @@
     \item Визуализация: истинные и предсказанные границы на белке
     \item Ошибки: ложные/пропущенные границы
   \end{itemize}
-  \includegraphics[width=0.8\textwidth]{example_pred.png} % вставьте пример
+  \begin{figure}
+      \centering
+      \includegraphics[width=0.8\linewidth]{example_pred.png}
+      \caption{Спрогнозированные границы доменов}
+      \label{fig:enter-label}
+  \end{figure}
+  
 \end{frame}
 
 % Слайд 11: Выводы
