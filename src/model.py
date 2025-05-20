@@ -36,18 +36,28 @@ def get_edge_index(contacts):
 
 # Определение простой графовой нейронной сети для классификации узлов (определения доменов)
 class DomainGCN(nn.Module):
-    def __init__(self, in_channels, hidden_channels, num_classes):
+    def __init__(self, in_channels, hidden_channels, num_classes, emb_channels = 10, mlp_hidden=64, mlp_layers=2):
         super(DomainGCN, self).__init__()
         self.conv1 = GCNConv(in_channels, hidden_channels)
         self.conv2 = GCNConv(hidden_channels, hidden_channels)
         self.conv3 = GCNConv(hidden_channels, hidden_channels)
-        self.conv4 = GCNConv(hidden_channels, num_classes)
+        self.conv4 = GCNConv(hidden_channels, emb_channels)
+        # Полносвязная часть (MLP)
+        mlp = []
+        mlp.append(nn.Linear(emb_channels, mlp_hidden))
+        mlp.append(nn.ReLU())
+        for _ in range(mlp_layers - 1):
+            mlp.append(nn.Linear(mlp_hidden, mlp_hidden))
+            mlp.append(nn.ReLU())
+        mlp.append(nn.Linear(mlp_hidden, num_classes))
+        self.mlp = nn.Sequential(*mlp)
         
     def forward(self, x, edge_index):
         x = F.relu(self.conv1(x, edge_index))
-        x = self.conv2(x, edge_index)
-        x = self.conv3(x, edge_index)
-        x = self.conv4(x, edge_index)
+        x = F.relu(self.conv2(x, edge_index))
+        x = F.relu(self.conv3(x, edge_index))
+        x = F.relu(self.conv4(x, edge_index))
+        x = self.mlp(x)
         return x
 
 # Извлечение координат CA и последовательной нумерации из PDB-файла
@@ -145,8 +155,8 @@ def get_domain_boundary_mask(res_ids, domain_ranges):
             if res == start or res == end:
                 mask[i] = 1
     return torch.tensor(mask, dtype=torch.long)
-MAX_ENTRIES = 1000  # Максимальное количество интервалов для загрузки из SCOP
-NUM_EPOCHS = 200  # Число эпох обучения
+MAX_ENTRIES = 1200  # Максимальное количество интервалов для загрузки из SCOP
+NUM_EPOCHS = 300  # Число эпох обучения
 def main():
     
     scop_url = "https://www.ebi.ac.uk/pdbe/scop/files/scop-cla-latest.txt"
@@ -163,7 +173,12 @@ def main():
         if not os.path.exists(pdb_file):
             pdbl = PDBList()
             pdb_file_path = pdbl.retrieve_pdb_file(pdb, pdir=".", file_format="pdb")
-            os.rename(pdb_file_path, pdb_file)
+            # Переименовываем только если файл существует
+            if os.path.exists(pdb_file_path):
+                os.rename(pdb_file_path, pdb_file)
+            else:
+                print(f"Файл {pdb_file_path} не найден. Пропускаем {pdb}_{chain}.")
+                continue
         coords, res_ids = extract_ca_coords_and_ids(pdb_file)
         if len(coords) == 0 or len(res_ids) == 0:
             continue  # Пропускаем пустые последовательности
@@ -185,15 +200,24 @@ def main():
     print(f"Train: {len(train_data)}, Test: {len(test_data)}")
 
     # Обучение и оценка
-    model = DomainGCN(in_channels=3, hidden_channels=16, num_classes=num_classes)
-    model = train_model(model, train_data, NUM_EPOCHS, lr=0.01, log_dir="./runs/domain_gcn")
+    model_path = 'domain_gcn_model.pth'
+    model = DomainGCN(in_channels=3, hidden_channels=32, num_classes=num_classes)
+    model = train_model(model, train_data, NUM_EPOCHS, lr=0.01, log_dir="./runs/domain_gcn", model_path=model_path)
+    # Загрузка модели с диска перед оценкой
+    model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
+    print(f'Модель загружена из {model_path}')
     evaluate_model(model, test_data)
     
-def train_model(model, train_data, num_epochs, lr=0.01, log_dir=None):
+def train_model(model, train_data, num_epochs, lr=0.01, log_dir=None, model_path='domain_gcn_model.pth'):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, min_lr=1e-5, verbose=True)
+    #scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.7)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=20, T_mult=2, eta_min=1e-5)
+    #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    #    optimizer, mode='min', factor=0.5, patience=10, min_lr=1e-5
+    #)
     # Приоритет классу 1 (граница)
-    criterion = nn.CrossEntropyLoss(weight=torch.tensor([0.1, 30.0]))
+    # criterion = nn.CrossEntropyLoss(weight=torch.tensor([1., 7.]))
+    criterion = nn.CrossEntropyLoss(weight=torch.tensor([1., 6.]))
     writer = SummaryWriter(log_dir=log_dir) if log_dir else None
     model.train()
     for epoch in tqdm(range(num_epochs)):
@@ -210,9 +234,12 @@ def train_model(model, train_data, num_epochs, lr=0.01, log_dir=None):
             writer.add_scalar('Loss/train', mean_loss, epoch)
             writer.add_scalar('LR', optimizer.param_groups[0]['lr'], epoch)
         tqdm.write(f"  Loss: {mean_loss:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f}")
-        scheduler.step(mean_loss)
+        scheduler.step(epoch + 1)
     if writer:
         writer.close()
+    # Сохраняем модель после обучения
+    torch.save(model.state_dict(), model_path)
+    print(f'Модель сохранена в {model_path}')
     return model
 
 def domak_predict(coords, res_ids, threshold=8.0):
@@ -257,26 +284,58 @@ def split_predict(coords, n_domains=2):
 
 def plot_domain_predictions(x, y_true, y_pred, y_domak, y_split, pdb_id, save_path=None):
     """
-    Визуализация разметки доменных границ для одной последовательности:
+    Визуализация разметки доменных границ и сегментов для одной последовательности:
     - y_true: ground truth
     - y_pred: предсказание модели
     - y_domak: DOMAK baseline
     - y_split: SPLIT baseline
     """
     L = len(y_true)
-    plt.figure(figsize=(12, 2))
-    plt.plot(np.arange(L), y_true, label='Ground Truth', drawstyle='steps-mid', lw=3)
-    plt.plot(np.arange(L), y_pred, label='GCN', drawstyle='steps-mid', lw=2)
-    plt.plot(np.arange(L), y_domak, label='DOMAK', drawstyle='steps-mid', lw=2)
-    plt.plot(np.arange(L), y_split, label='SPLIT', drawstyle='steps-mid', lw=2)
-    plt.xlabel('Индекс остатка')
-    plt.ylabel('Граница (1) / не граница (0)')
-    plt.title(f'Сравнение предсказаний доменных границ для {pdb_id}')
-    plt.legend(loc='upper right')
-    plt.tight_layout()
+    fig, axes = plt.subplots(2, 1, figsize=(14, 4), gridspec_kw={'height_ratios': [1, 2]})
+    # Верхний график: маски границ
+    axes[0].step(np.arange(L), y_true, where='mid', label='Ground Truth', lw=3)
+    axes[0].step(np.arange(L), y_pred, where='mid', label='GCN', lw=2)
+    axes[0].step(np.arange(L), y_domak, where='mid', label='DOMAK', lw=2)
+    axes[0].step(np.arange(L), y_split, where='mid', label='SPLIT', lw=2)
+    axes[0].set_ylabel('Граница (1/0)')
+    axes[0].set_title(f'Границы доменов для {pdb_id}')
+    axes[0].legend(loc='upper right', fontsize=8)
+    axes[0].set_xlim(0, L-1)
+    # Нижний график: сегменты (цветные полосы)
+    def plot_segments(ax, mask, label, color):
+        segments = mask_to_segments(mask)
+        for (start, end) in segments:
+            ax.axvspan(start, end, alpha=0.3, color=color, label=label)
+    ax2 = axes[1]
+    colors = ['tab:blue', 'tab:orange', 'tab:green', 'tab:red']
+    plot_segments(ax2, y_true, 'Ground Truth', colors[0])
+    plot_segments(ax2, y_pred, 'GCN', colors[1])
+    plot_segments(ax2, y_domak, 'DOMAK', colors[2])
+    plot_segments(ax2, y_split, 'SPLIT', colors[3])
+    ax2.set_xlim(0, L-1)
+    ax2.set_ylim(0, 1)
+    ax2.set_yticks([])
+    ax2.set_xlabel('Индекс остатка')
+    ax2.set_title('Сегменты доменов (цветные полосы)')
+    # Убираем дублирующиеся легенды
+    handles, labels = [], []
+    for ax in axes:
+        h, l = ax.get_legend_handles_labels()
+        handles += h
+        labels += l
+    by_label = dict(zip(labels, handles))
+    fig.legend(by_label.values(), by_label.keys(), loc='lower center', ncol=4)
+    plt.tight_layout(rect=[0, 0.08, 1, 1])
     if save_path:
         plt.savefig(save_path, dpi=200)
     plt.close()
+
+    from Bio.PDB import PDBParser
+    import nglview as nv
+    # Визуализация предсказания на примере
+    pdb_parser = PDBParser()
+    structure = pdb_parser.get_structure("PHA-L", f"./data/{id}.pdb")
+    view = nv.show_biopython(structure)
 
 def evaluate_model(model, test_data):
     ious, f1s, mbds = [], [], []
@@ -345,19 +404,24 @@ def evaluate_model(model, test_data):
     df = pd.DataFrame(results)
     print(df.to_string(index=False))
     df.to_csv('results_metrics.csv', index=False)
-    # Визуализация для одного белка (например, первого из теста)
-    if len(test_data) > 0:
-        x, edge_index, y, pdb, chain = test_data[0]
-        model.eval()
-        pred = model(x, edge_index).argmax(dim=1)
-        domak_mask = domak_predict(x.cpu().numpy(), np.arange(1, len(x)+1))
-        n_domains = max(1, len(mask_to_segments(y)))
-        split_mask = split_predict(x.cpu().numpy(), n_domains=n_domains)
-        plot_domain_predictions(
-            x, y.cpu().numpy(), pred.cpu().numpy(), domak_mask.cpu().numpy(), split_mask.cpu().numpy(),
-            pdb_id=f"{pdb}_{chain}", save_path="example_pred.png"
-        )
-        print(f"Визуализация сохранена в example_pred.png для {pdb}_{chain}")
+    # Визуализация для белка с >=2 доменами
+    found = False
+    for x, edge_index, y, pdb, chain in test_data:
+        n_domains = len(mask_to_segments(y))
+        if n_domains >= 3:
+            model.eval()
+            pred = model(x, edge_index).argmax(dim=1)
+            domak_mask = domak_predict(x.cpu().numpy(), np.arange(1, len(x)+1))
+            split_mask = split_predict(x.cpu().numpy(), n_domains=n_domains)
+            plot_domain_predictions(
+                x, y.cpu().numpy(), pred.cpu().numpy(), domak_mask.cpu().numpy(), split_mask.cpu().numpy(),
+                pdb_id=f"{pdb}_{chain}", save_path="example_pred.png"
+            )
+            print(f"Визуализация сохранена в example_pred.png для {pdb}_{chain} (домены: {n_domains})")
+            found = True
+            break
+    if not found:
+        print("В тестовой выборке нет белков с двумя и более доменами для визуализации.")
     return ious, f1s, mbds
 
 def compute_iou(y_pred, y_true):
@@ -370,7 +434,7 @@ def compute_iou(y_pred, y_true):
         return float('nan')
     return intersection / union
 
-def mask_to_segments(mask, min_length=10):
+def mask_to_segments(mask, min_length=20):
     """
     Преобразует бинарную маску границ (1 — граница, 0 — не граница) в список сегментов (start, end),
     игнорируя короткие сегменты (домен считается, только если длина >= min_length)
@@ -389,7 +453,7 @@ def mask_to_segments(mask, min_length=10):
             segments.append((prev, len(mask)-1))
     return segments
 
-def compute_iou_domains(pred_mask, true_mask, min_length=10):
+def compute_iou_domains(pred_mask, true_mask, min_length=20):
     """
     IoU для доменных сегментов, полученных из бинарных масок границ,
     игнорируя короткие сегменты (домен считается, только если длина >= min_length)
